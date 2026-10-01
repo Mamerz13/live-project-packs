@@ -1,0 +1,6 @@
+.DS_Store
+build/
+outputs/
+tmp/
+__pycache__/
+*.o
