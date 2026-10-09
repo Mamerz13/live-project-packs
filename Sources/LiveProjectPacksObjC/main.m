@@ -249,10 +249,11 @@ static NSImage *ChipBadgeImage(NSString *symbolName, NSColor *badgeColor, CGFloa
 // phosphor black (not neutral gray-black), a real metallic brass for the
 // physical bezel, and phosphor amber reserved for what you can act on —
 // the same "gold = actionable" rule as before, just with more presence.
-static NSColor *VoltScreenColor(void) { return [NSColor colorWithCalibratedRed:0.058 green:0.040 blue:0.026 alpha:1]; }
-static NSColor *VoltBrassColor(void) { return [NSColor colorWithCalibratedRed:0.58 green:0.44 blue:0.26 alpha:1]; }
-static NSColor *VoltGoldColor(void) { return [NSColor colorWithCalibratedRed:0.88 green:0.62 blue:0.27 alpha:1]; }
-static NSColor *VoltAmberColor(void) { return [NSColor colorWithCalibratedRed:0.70 green:0.50 blue:0.28 alpha:1]; }
+static NSColor *VoltScreenColor(void) { return [NSColor colorWithCalibratedRed:0.085 green:0.094 blue:0.110 alpha:1]; }
+// "Gold" is now a soft slate blue (name kept so call sites don't churn):
+// the warm amber palette was tiring on the eyes.
+static NSColor *VoltGoldColor(void) { return [NSColor colorWithCalibratedRed:0.50 green:0.64 blue:0.84 alpha:1]; }
+static NSColor *VoltAmberColor(void) { return [NSColor colorWithCalibratedRed:0.45 green:0.55 blue:0.70 alpha:1]; }
 static NSColor *VoltTealColor(void) { return [NSColor colorWithCalibratedRed:0.44 green:0.62 blue:0.60 alpha:1]; }
 
 // A single idle/hover/pressed contrast ladder for every neutral surface —
@@ -271,65 +272,15 @@ static NSColor *VoltGoldPressedColor(void) { return [VoltGoldColor() blendedColo
 // for when the AI is actually doing something, never used decoratively
 // elsewhere; mint marks online/synced/success so it never gets confused
 // with the amber "everything is normal" signal.
-static NSColor *PackRimAmberColor(void) { return [NSColor colorWithCalibratedRed:0.96 green:0.82 blue:0.48 alpha:1]; }
+static NSColor *PackRimAmberColor(void) { return [NSColor colorWithCalibratedRed:0.52 green:0.66 blue:0.86 alpha:1]; }
 static NSColor *PackRimAIPurpleColor(void) { return [NSColor colorWithCalibratedRed:0.58 green:0.42 blue:0.95 alpha:1]; }
-static NSColor *PackRimAIBlueColor(void) { return [NSColor colorWithCalibratedRed:0.36 green:0.55 blue:0.96 alpha:1]; }
+static NSColor *PackRimAIBlueColor(void) { return [NSColor colorWithCalibratedRed:0.80 green:0.52 blue:0.94 alpha:1]; }
 static NSColor *PackMintColor(void) { return [NSColor colorWithCalibratedRed:0.42 green:0.82 blue:0.68 alpha:1]; }
 
 // Every structural line (frame seams, dividers) draws in this instead of
 // gold or brass — chrome should describe an edge; the warm tones are
 // reserved for the physical bezel and for things you can act on.
-static NSColor *VoltLineColor(void) { return [NSColor colorWithCalibratedRed:0.42 green:0.36 blue:0.28 alpha:1]; }
-
-// Small rivet dots sitting in the brass bezel band itself — like screws on
-// a real enclosure — instead of abstract HUD targeting marks. Purely
-// decorative CALayers (not NSViews), so they never intercept a click.
-static void AddCornerRivets(NSView *container, CGFloat bezelWidth, NSColor *color) {
-    CGFloat w = container.bounds.size.width;
-    CGFloat h = container.bounds.size.height;
-    CGFloat size = 4.5;
-    CGFloat inset = bezelWidth / 2;
-
-    NSPoint corners[4] = {
-        NSMakePoint(inset, h - inset),
-        NSMakePoint(w - inset, h - inset),
-        NSMakePoint(inset, inset),
-        NSMakePoint(w - inset, inset),
-    };
-    for (NSInteger i = 0; i < 4; i++) {
-        NSPoint p = corners[i];
-        CALayer *rivet = [CALayer layer];
-        rivet.frame = NSMakeRect(p.x - size / 2, p.y - size / 2, size, size);
-        rivet.backgroundColor = color.CGColor;
-        rivet.cornerRadius = size / 2;
-        rivet.borderWidth = 0.5;
-        rivet.borderColor = [NSColor.blackColor colorWithAlphaComponent:0.45].CGColor;
-        [container.layer addSublayer:rivet];
-    }
-}
-
-// A near-imperceptible scanline texture — the difference between "a dark
-// rounded rectangle" and "a screen." Purely decorative: hit-testing is
-// disabled so it never steals a click meant for what's underneath it.
-@interface LPPScanlineOverlay : NSView
-@end
-@implementation LPPScanlineOverlay
-- (BOOL)isOpaque { return NO; }
-- (NSView *)hitTest:(NSPoint)point { return nil; }
-- (void)drawRect:(NSRect)dirtyRect {
-    [[NSColor colorWithCalibratedWhite:1 alpha:0.018] setFill];
-    for (CGFloat y = 0; y < NSHeight(self.bounds); y += 3) {
-        NSRectFillUsingOperation(NSMakeRect(0, y, NSWidth(self.bounds), 1), NSCompositingOperationSourceOver);
-    }
-}
-@end
-
-static LPPScanlineOverlay *AddScanlineOverlay(NSView *container) {
-    LPPScanlineOverlay *overlay = [[LPPScanlineOverlay alloc] initWithFrame:container.bounds];
-    overlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    [container addSubview:overlay];
-    return overlay;
-}
+static NSColor *VoltLineColor(void) { return [NSColor colorWithCalibratedRed:0.32 green:0.36 blue:0.42 alpha:1]; }
 
 // A glowing streak that continuously travels around a panel's rounded edge
 // — a faint full-perimeter hairline underneath, plus one bright dashed
@@ -413,15 +364,10 @@ static LPPRimGlowOverlay *AddRimGlowOverlay(NSView *container, CGFloat cornerRad
     return overlay;
 }
 
-// Gives a panel's content view Volt's screen-bezel treatment: this is meant
-// to read as an actual physical screen mounted in Volt's body, not a themed
-// rounded rectangle. A thick brass bezel (not a hairline), a dark seam
-// where the "glass" meets the frame, corner rivets, and a faint scanline
-// texture on the glass itself. One shared place so every popup panel this
-// app opens is visually the same device, not five different dialogs.
-//
-// Existing content margins (14-18pt) already clear this bezel width, so
-// nothing that calls this needs to change how it positions its own children.
+// Flat dark rounded surface shared by every utility popup — no bezel, seam,
+// rivets or scanlines (they ate ~9pt per side and read as clutter next to
+// the borderless main shelf and Ask AI panel). kVoltBezelWidth survives only
+// as a content inset some panels already lay themselves out against.
 static const CGFloat kVoltBezelWidth = 9;
 
 static void ApplyVoltScreenChrome(NSView *content) {
@@ -429,20 +375,6 @@ static void ApplyVoltScreenChrome(NSView *content) {
     content.layer.backgroundColor = VoltScreenColor().CGColor;
     content.layer.cornerRadius = 16;
     content.layer.masksToBounds = YES;
-    content.layer.borderWidth = kVoltBezelWidth;
-    content.layer.borderColor = VoltBrassColor().CGColor;
-
-    // The seam: a dark inset line just inside the bezel, suggesting the
-    // glass sits recessed into the frame rather than being flush with it.
-    CALayer *seam = [CALayer layer];
-    seam.frame = NSInsetRect(content.bounds, kVoltBezelWidth, kVoltBezelWidth);
-    seam.borderWidth = 1;
-    seam.borderColor = [NSColor.blackColor colorWithAlphaComponent:0.55].CGColor;
-    seam.cornerRadius = 8;
-    [content.layer addSublayer:seam];
-
-    AddScanlineOverlay(content);
-    AddCornerRivets(content, kVoltBezelWidth, [VoltLineColor() colorWithAlphaComponent:0.7]);
 }
 
 static NSArray<NSPasteboardType> *AcceptedDropTypes(void) {
@@ -2260,7 +2192,7 @@ static NSString *PackContextSummaryForAssets(NSArray<NSMutableDictionary *> *ass
     // as the card lighting up from within — "illuminated glass," not a
     // colored rectangle stamped on top.
     NSColor *background = selected
-        ? [NSColor colorWithCalibratedRed:0.98 green:0.9 blue:0.72 alpha:0.16]
+        ? [NSColor colorWithCalibratedRed:0.70 green:0.80 blue:0.98 alpha:0.16]
         : [NSColor colorWithCalibratedWhite:0.14 alpha:(self.hovered ? 1 : 0.9)];
     self.layer.backgroundColor = background.CGColor;
     self.layer.borderWidth = selected ? 1 : 0;
@@ -2623,8 +2555,39 @@ static NSString *PackContextSummaryForAssets(NSArray<NSMutableDictionary *> *ass
 @end
 
 @implementation AppController
+// A menu-bar-less accessory app has no main menu at all, and Cmd+C/V/X/A/Z
+// in a text field are routed through the Edit menu's key equivalents — so
+// with none installed, copy/paste/select-all/undo silently did nothing in
+// every text view. The menu is never shown; it just owns the shortcuts.
+- (void)installEditMenu {
+    NSMenu *mainMenu = [[NSMenu alloc] init];
+    NSMenuItem *appItem = [[NSMenuItem alloc] init];
+    appItem.submenu = [[NSMenu alloc] initWithTitle:@"Packs"];
+    [mainMenu addItem:appItem];
+
+    NSMenu *edit = [[NSMenu alloc] initWithTitle:@"Edit"];
+    NSArray *entries = @[
+        @[@"Undo", @"undo:", @"z", @0],
+        @[@"Redo", @"redo:", @"z", @(NSEventModifierFlagCommand | NSEventModifierFlagShift)],
+        @[@"Cut", @"cut:", @"x", @0],
+        @[@"Copy", @"copy:", @"c", @0],
+        @[@"Paste", @"paste:", @"v", @0],
+        @[@"Select All", @"selectAll:", @"a", @0],
+    ];
+    for (NSArray *entry in entries) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:entry[0] action:NSSelectorFromString(entry[1]) keyEquivalent:entry[2]];
+        if ([entry[3] unsignedIntegerValue]) item.keyEquivalentModifierMask = [entry[3] unsignedIntegerValue];
+        [edit addItem:item];
+    }
+    NSMenuItem *editItem = [[NSMenuItem alloc] init];
+    editItem.submenu = edit;
+    [mainMenu addItem:editItem];
+    NSApp.mainMenu = mainMenu;
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     NSApp.activationPolicy = NSApplicationActivationPolicyAccessory;
+    [self installEditMenu];
     NSApp.applicationIconImage = AppIconImage();
     LPPLog(@"app.launch", @{ @"version": NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"development" });
     [self seedData];
@@ -3087,7 +3050,11 @@ static OSStatus HotKeyHandler(__unused EventHandlerCallRef nextHandler, EventRef
     }
 
     if (self.previewPanel.visible) {
-        if (plainKey && (isSpace || isEscape)) {
+        // Space is Quick Look's "dismiss", but notes are editable now — it has
+        // to type a space when you're in the text, and keys typed into other
+        // panels (Ask AI, note composer) must never close the preview.
+        BOOL typingInPreview = event.window == self.previewPanel && [event.window.firstResponder isKindOfClass:NSTextView.class];
+        if (plainKey && event.window == self.previewPanel && (isEscape || (isSpace && !typingInPreview))) {
             [self closePreview];
             return YES;
         }
@@ -4514,7 +4481,7 @@ static OSStatus HotKeyHandler(__unused EventHandlerCallRef nextHandler, EventRef
     // opacity so this stays a solid dark surface regardless of what's behind
     // the window, instead of leaning on the "behind window" blur to fill in
     // most of its own background.
-    glass.layer.backgroundColor = [VoltScreenColor() colorWithAlphaComponent:0.88].CGColor;
+    glass.layer.backgroundColor = VoltScreenColor().CGColor;
     [cardContainer addSubview:glass];
     NSView *content = glass;
 
@@ -4837,7 +4804,7 @@ static OSStatus HotKeyHandler(__unused EventHandlerCallRef nextHandler, EventRef
     // behind it on screen, so it read as pale/washed-out over a light
     // background (a browser window, a light desktop) instead of staying a
     // consistent dark surface regardless of what's underneath it.
-    glass.layer.backgroundColor = [VoltScreenColor() colorWithAlphaComponent:0.88].CGColor;
+    glass.layer.backgroundColor = VoltScreenColor().CGColor;
     [cardContainer addSubview:glass];
 
     self.askAIContentView = glass;
@@ -5505,12 +5472,16 @@ static void DetectQRCodeURLInImage(NSImage *image, void (^completion)(NSURL * _N
     preview.backgroundColor = VoltScreenColor();
     preview.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
     preview.minSize = NSMakeSize(360, 300);
+    // The title bar's text just repeats the asset title shown below; blend
+    // the bar into the surface so only the traffic lights remain.
+    preview.titleVisibility = NSWindowTitleHidden;
+    preview.titlebarAppearsTransparent = YES;
 
     NSView *content = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, previewWidth, previewHeight)];
     ApplyVoltScreenChrome(content);
     preview.contentView = content;
 
-    NSRect mediaFrame = NSMakeRect(18, 74, previewWidth - 36, previewHeight - 94);
+    NSRect mediaFrame = NSMakeRect(18, 18, previewWidth - 36, previewHeight - 38);
     if (IsLiveClip(asset)) {
         NSDictionary *clip = asset[@"liveClip"];
         NSDictionary *contentInfo = [clip[@"extractedContent"] isKindOfClass:NSDictionary.class] ? clip[@"extractedContent"] : @{};
@@ -5531,7 +5502,7 @@ static void DetectQRCodeURLInImage(NSImage *image, void (^completion)(NSURL * _N
             summaryView.string = summary;
             summaryScroll.documentView = summaryView;
             [content addSubview:summaryScroll];
-            mediaFrame = NSMakeRect(18, 74, previewWidth - 36, previewHeight - 270);
+            mediaFrame = NSMakeRect(18, 18, previewWidth - 36, previewHeight - 214);
         }
         NSDictionary *source = LiveClipSource(asset);
         NSString *app = source[@"applicationName"] ?: @"Unknown source";
@@ -5589,6 +5560,13 @@ static void DetectQRCodeURLInImage(NSImage *image, void (^completion)(NSURL * _N
         refreshButton.frame = NSMakeRect(previewWidth - 128, previewHeight - 234, 110, 30);
         [content addSubview:refreshButton];
     }
+    // Resizing: everything built so far (LiveClip header text/buttons) is
+    // pinned to the top and right edges; the media below stretches to fill.
+    for (NSView *view in content.subviews) {
+        BOOL rightSide = NSMinX(view.frame) > previewWidth / 2;
+        BOOL fullWidth = NSWidth(view.frame) > previewWidth * 0.8;
+        view.autoresizingMask = NSViewMinYMargin | (fullWidth ? NSViewWidthSizable : (rightSide ? NSViewMinXMargin : 0));
+    }
     NSString *payload = AssetPayload(asset);
     if (payload.length && !AssetFilePath(asset).length && !AssetOriginURL(asset)) {
         BOOL isEditableNote = [asset[@"kind"] isEqualToString:@"Note"];
@@ -5596,13 +5574,23 @@ static void DetectQRCodeURLInImage(NSImage *image, void (^completion)(NSURL * _N
         textScroll.drawsBackground = NO;
         textScroll.hasVerticalScroller = YES;
         textScroll.borderType = NSNoBorder;
+        textScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         NSTextView *textView = [[NSTextView alloc] initWithFrame:textScroll.bounds];
+        textView.autoresizingMask = NSViewWidthSizable;
+        textView.verticallyResizable = YES;
+        textView.textContainer.widthTracksTextView = YES;
         textView.editable = isEditableNote;
         textView.selectable = YES;
         textView.drawsBackground = NO;
-        textView.textColor = [NSColor colorWithCalibratedWhite:0.9 alpha:1];
-        textView.font = [NSFont systemFontOfSize:14];
-        textView.textContainerInset = NSMakeSize(12, 12);
+        // Terminal feel: monospaced, warm phosphor text, gold caret, a
+        // little extra line spacing so it reads like a console, not a doc.
+        textView.textColor = [NSColor colorWithCalibratedRed:0.86 green:0.89 blue:0.93 alpha:1];
+        textView.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
+        textView.insertionPointColor = VoltGoldColor();
+        NSMutableParagraphStyle *terminalStyle = [NSMutableParagraphStyle new];
+        terminalStyle.lineSpacing = 4;
+        textView.defaultParagraphStyle = terminalStyle;
+        textView.textContainerInset = NSMakeSize(14, 14);
         textView.string = payload;
         textScroll.documentView = textView;
         // Notes are meant to be lived in during class, not just glanced at —
@@ -5624,6 +5612,7 @@ static void DetectQRCodeURLInImage(NSImage *image, void (^completion)(NSURL * _N
             imageView.layer.masksToBounds = YES;
             imageView.layer.backgroundColor = [NSColor colorWithCalibratedWhite:1 alpha:0.035].CGColor;
             imageView.imageScaling = NSImageScaleProportionallyUpOrDown;
+            imageView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
             NSImage *sourceImage = ImmediatePreviewImage(asset);
             imageView.image = sourceImage ?: [NSImage imageWithSystemSymbolName:IconForKind(asset[@"kind"]) accessibilityDescription:nil];
             imageView.contentTintColor = MutedKindColor(asset[@"kind"]);
@@ -5647,11 +5636,16 @@ static void DetectQRCodeURLInImage(NSImage *image, void (^completion)(NSURL * _N
                     // the title/subtitle/Open row below is already full
                     // (title + subtitle span nearly to where Open sits),
                     // so there's no free space left down there for this.
-                    NSButton *qrButton = [NSButton buttonWithTitle:@"Open QR Link" target:strongSelf action:@selector(openDetectedQRLink:)];
-                    qrButton.bezelStyle = NSBezelStyleTexturedRounded;
+                    HoverIconButton *qrButton = [HoverIconButton buttonWithImage:[[NSImage imageWithSystemSymbolName:@"qrcode" accessibilityDescription:@"Open QR Link"] imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:14 weight:NSFontWeightMedium]] target:strongSelf action:@selector(openDetectedQRLink:)];
+                    qrButton.imagePosition = NSImageOnly;
                     qrButton.contentTintColor = VoltTealColor();
-                    qrButton.frame = NSMakeRect(NSMinX(mediaFrame) + 10, NSMinY(mediaFrame) + 10, 130, 30);
-                    qrButton.toolTip = url.absoluteString;
+                    qrButton.idleBackground = [NSColor colorWithCalibratedWhite:0.08 alpha:0.75];
+                    qrButton.hoverBackground = SurfaceHoverColor();
+                    qrButton.pressedBackground = SurfacePressedColor();
+                    qrButton.layer.cornerRadius = 7;
+                    qrButton.frame = NSMakeRect(NSMinX(mediaFrame) + 10, NSMinY(mediaFrame) + 10, 30, 28);
+                    qrButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+                    qrButton.toolTip = [@"Open QR link: " stringByAppendingString:url.absoluteString];
                     [content addSubview:qrButton];
                 });
             }
@@ -5674,27 +5668,39 @@ static void DetectQRCodeURLInImage(NSImage *image, void (^completion)(NSURL * _N
         }
     }
 
-    NSTextField *title = [NSTextField labelWithString:asset[@"title"] ?: @"Untitled asset"];
-    title.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
-    title.textColor = [NSColor colorWithCalibratedWhite:0.94 alpha:1];
-    title.lineBreakMode = NSLineBreakByTruncatingTail;
-    title.frame = NSMakeRect(18, 43, previewWidth - 130, 18);
-    [content addSubview:title];
-
-    NSTextField *subtitle = [NSTextField labelWithString:AssetSubtitle(asset)];
-    subtitle.font = [NSFont systemFontOfSize:10.5];
-    subtitle.textColor = [NSColor colorWithCalibratedWhite:0.6 alpha:1];
-    subtitle.lineBreakMode = NSLineBreakByTruncatingTail;
-    subtitle.frame = NSMakeRect(18, 22, previewWidth - 130, 16);
-    [content addSubview:subtitle];
-
-    if (AssetFilePath(asset).length || AssetOriginURL(asset)) {
-        NSButton *open = [NSButton buttonWithTitle:AssetOriginURL(asset) ? @"Open Link" : @"Open" target:self action:@selector(openPreviewedAsset:)];
-        open.bezelStyle = NSBezelStyleTexturedRounded;
-        open.frame = NSMakeRect(previewWidth - 104, 22, 86, 30);
+    // No text row along the bottom anymore — the title/kind/uploader/age
+    // live behind an info icon's tooltip, and Open sits beside it, both
+    // tucked in the bottom-right corner over the content so the content
+    // gets the whole panel.
+    NSImageSymbolConfiguration *cornerIconConfig = [NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightMedium];
+    CGFloat cornerX = previewWidth - 18 - 26;
+    BOOL hasOpen = AssetFilePath(asset).length || AssetOriginURL(asset);
+    if (hasOpen) {
+        BOOL isLink = AssetOriginURL(asset) != nil;
+        HoverIconButton *open = [HoverIconButton buttonWithImage:[[NSImage imageWithSystemSymbolName:isLink ? @"link" : @"arrow.up.right.square" accessibilityDescription:isLink ? @"Open Link" : @"Open"] imageWithSymbolConfiguration:cornerIconConfig] target:self action:@selector(openPreviewedAsset:)];
+        open.imagePosition = NSImageOnly;
+        open.contentTintColor = [NSColor colorWithCalibratedWhite:0.85 alpha:1];
+        open.idleBackground = [NSColor colorWithCalibratedWhite:0.06 alpha:0.7];
+        open.hoverBackground = SurfaceHoverColor();
+        open.pressedBackground = SurfacePressedColor();
+        open.layer.cornerRadius = 6;
+        open.toolTip = isLink ? @"Open Link" : @"Open";
+        open.frame = NSMakeRect(cornerX, 24, 26, 24);
+        open.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
         open.keyEquivalent = @"\r";
         [content addSubview:open];
+        cornerX -= 30;
     }
+    HoverIconButton *info = [HoverIconButton buttonWithImage:[[NSImage imageWithSystemSymbolName:@"info.circle" accessibilityDescription:@"Details"] imageWithSymbolConfiguration:cornerIconConfig] target:nil action:nil];
+    info.imagePosition = NSImageOnly;
+    info.contentTintColor = [NSColor colorWithCalibratedWhite:0.7 alpha:1];
+    info.idleBackground = [NSColor colorWithCalibratedWhite:0.06 alpha:0.7];
+    info.hoverBackground = SurfaceHoverColor();
+    info.layer.cornerRadius = 6;
+    info.toolTip = [NSString stringWithFormat:@"%@\n%@", asset[@"title"] ?: @"Untitled asset", AssetSubtitle(asset)];
+    info.frame = NSMakeRect(cornerX, 24, 26, 24);
+    info.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    [content addSubview:info];
 
     self.previewPanel = preview;
     [preview makeKeyAndOrderFront:nil];
@@ -6791,7 +6797,7 @@ static void DetectQRCodeURLInImage(NSImage *image, void (^completion)(NSURL * _N
     // washed-out against whatever was behind the window; a near-opaque
     // surface gives every card, pill, and piece of text sitting on top of
     // it something solid and high-contrast to read against.
-    NSColor *chrome = [NSColor colorWithCalibratedRed:0.075 green:0.055 blue:0.038 alpha:0.88];
+    NSColor *chrome = [NSColor colorWithCalibratedRed:0.085 green:0.094 blue:0.110 alpha:1];
     // No border here, matching the Ask AI panel and every other control on
     // this screen now — the fill color against the desktop is what defines
     // the edge, not a stroke. Minimal wins; the bezel stays on the small
