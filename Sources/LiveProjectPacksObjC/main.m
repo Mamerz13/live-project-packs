@@ -9,6 +9,7 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import "AIExplainer-Swift.h"
 #import "LPPAssetHelpers.h"
+#import "LPPPackExport.h"
 #import "LPPLiveClipCore.h"
 #import "LPPWebParsing.h"
 
@@ -609,6 +610,19 @@ static NSPoint ClampedPanelOrigin(NSPoint proposed, NSSize panelSize, NSRect vis
 // the Pack itself — this is a personal window habit, not Pack data).
 static NSString *const kAskAIPanelFrameDefaultsKey = @"LPPAskAIPanelFrame";
 
+// Writing-assist for note text views: real macOS autocorrect (red-underline
+// spell check, auto-fix on word end, text replacements) but with smart
+// quotes/dashes left off — notes here are as likely to hold SQL or code as
+// prose, and curly quotes would silently break pasted queries.
+static void EnableNoteAutocorrect(NSTextView *textView) {
+    textView.continuousSpellCheckingEnabled = YES;
+    textView.automaticSpellingCorrectionEnabled = YES;
+    textView.automaticTextReplacementEnabled = YES;
+    textView.grammarCheckingEnabled = YES;
+    textView.automaticQuoteSubstitutionEnabled = NO;
+    textView.automaticDashSubstitutionEnabled = NO;
+}
+
 static void SaveNamedPanelFrame(NSString *key, NSRect frame) {
     [NSUserDefaults.standardUserDefaults setObject:NSStringFromRect(frame) forKey:key];
 }
@@ -696,38 +710,220 @@ typedef NS_ENUM(NSInteger, VoltGestureKind) {
     VoltGestureNone = -1,
     VoltGestureHop = 0,
     VoltGestureSquash = 1,
-    VoltGestureWobble = 2
+    VoltGestureWobble = 2,
+    VoltGestureCheer = 3,
+    VoltGestureStartle = 4,
+    VoltGestureYawn = 5,
+    VoltGestureLookAround = 6,
+    // These two last until something ends them, rather than for a fixed time.
+    VoltGestureThink = 7,
+    VoltGestureSleep = 8
 };
 
-static const NSTimeInterval VoltGestureDuration = 0.66;
+typedef struct { CGFloat sx, sy, lift, drift; } VoltPose;
 
-// Volt's idle motion is driven by resizing his frame rather than by a Core Animation
-// transform: AppKit owns the transform of a layer-backed view's layer, so a transform
-// animation there never reaches the screen.
-static NSRect VoltIdleFrame(NSRect rest, NSTimeInterval clock, NSTimeInterval gestureElapsed, NSInteger gestureKind) {
-    // The bob and breath periods are deliberately not multiples of each other, so they
-    // drift in and out of phase instead of locking into an obvious loop.
-    CGFloat bob = sin(clock * (2 * M_PI / 3.4)) * 2.0;
-    CGFloat scale = 1.0 + sin(clock * (2 * M_PI / 2.8)) * 0.009;
-    CGFloat lift = 0;
-    CGFloat drift = 0;
-
-    if (gestureKind != VoltGestureNone && gestureElapsed >= 0 && gestureElapsed < VoltGestureDuration) {
-        CGFloat progress = gestureElapsed / VoltGestureDuration;
-        CGFloat arc = sin(progress * M_PI);
-        if (gestureKind == VoltGestureHop) lift = arc * 9.0;
-        else if (gestureKind == VoltGestureSquash) scale -= arc * 0.06;
-        else drift = sin(progress * 4 * M_PI) * 2.5 * (1.0 - progress);
+static NSTimeInterval VoltGestureDuration(NSInteger kind) {
+    switch (kind) {
+        case VoltGestureHop: return 0.95;
+        case VoltGestureSquash: return 0.60;
+        case VoltGestureWobble: return 0.80;
+        case VoltGestureCheer: return 1.50;
+        case VoltGestureStartle: return 0.85;
+        case VoltGestureYawn: return 1.8;
+        case VoltGestureLookAround: return 2.4;
+        case VoltGestureThink:
+        case VoltGestureSleep: return INFINITY;
+        default: return 0;
     }
+}
 
-    CGFloat width = rest.size.width * scale;
-    CGFloat height = rest.size.height * scale;
+static CGFloat VoltSmoothstep(CGFloat u) {
+    u = MIN(MAX(u, 0), 1);
+    return u * u * (3 - 2 * u);
+}
+
+// sy drives the squash and stretch; sx follows it so the body keeps its volume.
+static VoltPose VoltPoseWithSY(CGFloat sy, CGFloat lift, CGFloat drift) {
+    return (VoltPose){pow(sy, -0.6), sy, lift, drift};
+}
+
+// Crouch (anticipation) -> launch stretch -> airtime -> impact squash -> springy settle.
+static VoltPose VoltJumpPose(NSTimeInterval t, CGFloat height, NSTimeInterval crouch, NSTimeInterval air) {
+    const CGFloat crouchDepth = 0.84;
+    if (t < crouch) return VoltPoseWithSY(1 - (1 - crouchDepth) * VoltSmoothstep(t / crouch), 0, 0);
+    NSTimeInterval flight = t - crouch;
+    if (flight < air) {
+        CGFloat v = flight / air;
+        CGFloat (^stretch)(CGFloat) = ^CGFloat(CGFloat p) { return 1 + 0.14 * pow(1 - p, 2) + 0.10 * pow(p, 3); };
+        CGFloat sy = v < 0.1 ? crouchDepth + (stretch(0.1) - crouchDepth) * VoltSmoothstep(v / 0.1) : stretch(v);
+        return VoltPoseWithSY(sy, height * 4 * v * (1 - v), 0);
+    }
+    NSTimeInterval since = flight - air;
+    return VoltPoseWithSY(1 - 0.20 * exp(-8 * since) * cos(20 * since), 0, 0);
+}
+
+static VoltPose VoltGesturePose(NSInteger kind, NSTimeInterval t) {
+    switch (kind) {
+        case VoltGestureHop:
+            return VoltJumpPose(t, 9, 0.16, 0.34);
+        case VoltGestureStartle:
+            return VoltJumpPose(t, 10, 0.04, 0.26);
+        case VoltGestureCheer:
+            // Two hops: a big one, then a smaller echo before the first has fully settled.
+            return t < 0.62 ? VoltJumpPose(t, 10, 0.14, 0.34) : VoltJumpPose(t - 0.62, 7, 0.08, 0.28);
+        case VoltGestureSquash:
+            return VoltPoseWithSY(1 - 0.18 * exp(-7 * t) * cos(18 * t), 0, 0);
+        case VoltGestureWobble: {
+            CGFloat fade = 1 - t / VoltGestureDuration(VoltGestureWobble);
+            return VoltPoseWithSY(1 + 0.035 * sin(t * 2 * M_PI * 6.4) * fade, 0, sin(t * 2 * M_PI * 3.2) * 3.0 * fade);
+        }
+        case VoltGestureYawn: {
+            // A slow stretch up and back down.
+            CGFloat arc = sin(M_PI * t / VoltGestureDuration(VoltGestureYawn));
+            return VoltPoseWithSY(1 + 0.08 * arc * arc, 0, 0);
+        }
+        case VoltGestureThink:
+            // A restless little bounce and shuffle, like tapping his feet.
+            return VoltPoseWithSY(1 + 0.025 * sin(t * 2 * M_PI * 2.2), 0, sin(t * 2 * M_PI * 1.1));
+        case VoltGestureSleep: {
+            // Slumps lower, then breathes slowly.
+            CGFloat settle = VoltSmoothstep(t / 1.2);
+            return VoltPoseWithSY(1 - 0.07 * settle + 0.02 * settle * sin(t * 2 * M_PI / 4.0), 0, 0);
+        }
+        default:
+            return VoltPoseWithSY(1, 0, 0);
+    }
+}
+
+// Volt's motion is driven by resizing his frame rather than by a Core Animation
+// transform: AppKit owns the transform of a layer-backed view's layer, so a transform
+// animation there never reaches the screen. His feet stay planted on the rest frame's
+// bottom edge, so squash and stretch read as weight instead of floating.
+static NSRect VoltIdleFrame(NSRect rest, NSTimeInterval clock, NSTimeInterval gestureElapsed, NSInteger gestureKind, CGFloat lean) {
+    // Breathing and sway use periods that are not multiples of each other, so they drift
+    // in and out of phase instead of locking into an obvious loop.
+    VoltPose pose = VoltPoseWithSY(1 + 0.022 * sin(clock * (2 * M_PI / 2.6)), 0, 0);
+    CGFloat sway = sin(clock * (2 * M_PI / 5.3));
+    if (gestureKind != VoltGestureNone && gestureElapsed >= 0 && gestureElapsed < VoltGestureDuration(gestureKind)) {
+        VoltPose gesture = VoltGesturePose(gestureKind, gestureElapsed);
+        pose.sx *= gesture.sx;
+        pose.sy *= gesture.sy;
+        pose.lift = gesture.lift;
+        pose.drift = gesture.drift;
+    }
+    CGFloat width = rest.size.width * pose.sx;
+    CGFloat height = rest.size.height * pose.sy;
     return NSMakeRect(
-        NSMinX(rest) + (rest.size.width - width) / 2 + drift,
-        NSMinY(rest) + (rest.size.height - height) / 2 + bob + lift,
+        NSMidX(rest) - width / 2 + pose.drift + sway + lean * 3.0,
+        NSMinY(rest) + pose.lift,
         width,
         height
     );
+}
+
+// ---- Volt's screen --------------------------------------------------------
+// The art has a baked-in `>_`. While Volt animates, a dark patch covers it and these
+// pixel faces are drawn on the glass instead, so the screen can type, blink and react.
+
+typedef NS_ENUM(NSInteger, VoltFace) {
+    VoltFacePrompt,
+    VoltFaceDots,
+    VoltFaceAlert,
+    VoltFaceQuestion,
+    VoltFaceHeart,
+    VoltFaceCheck,
+    VoltFaceYawn,
+    VoltFaceSleep,
+    VoltFaceThink
+};
+
+enum { VoltScreenCols = 14, VoltScreenRows = 11 };
+typedef struct { char cells[VoltScreenRows][VoltScreenCols]; } VoltScreenGrid;
+
+// Where the screen sits in a mascot image, measured from the art: `anchor` is the
+// midpoint between the two orange cheek marks (in image pixels, y down), `angle` the
+// screen's tilt in degrees, `cell` the size of one screen pixel in image pixels.
+typedef struct { CGFloat artW, artH, anchorX, anchorY, angle, cell; } VoltScreenSpec;
+static const VoltScreenSpec VoltIdleScreenSpec = {1236, 1273, 695.5, 640.0, 5.0, 31.0};
+static const VoltScreenSpec VoltSuccessScreenSpec = {1230, 1278, 664.5, 608.5, 4.75, 29.65};
+
+static void VoltPutGlyph(VoltScreenGrid *grid, const char *const *rows, int count, int x, int y, char color, int dx, int dy, BOOL glitch) {
+    for (int r = 0; r < count; r++) {
+        int gy = y + r + dy;
+        int shift = dx + ((glitch && (gy % 3) == 0) ? 1 : 0);
+        for (int c = 0; rows[r][c]; c++) {
+            int gx = x + c + shift;
+            if (rows[r][c] == '#' && gx >= 0 && gx < VoltScreenCols && gy >= 0 && gy < VoltScreenRows) grid->cells[gy][gx] = color;
+        }
+    }
+}
+
+// `step` is the face's animation frame: dots shown, zzz shown, or the spinner's head.
+// '#' glyph pixels are mint, 'o' the orange cheeks, 'p' pink, 'd' dim mint, and
+// 'v' 'w' 'x' the AI purple spinner head and its fading trail. The glyph shifts with
+// (lookX, lookY) so Volt appears to look at the cursor; the cheeks stay put.
+static VoltScreenGrid VoltScreenForFace(VoltFace face, int step, BOOL cursorOn, int lookX, int lookY, BOOL glitch) {
+    static const char *const chevron[] = {"##..", ".##.", "..##", ".##.", "##.."};
+    static const char *const cursor[] = {"####"};
+    static const char *const dot[] = {"#", "#"};
+    static const char *const bang[] = {"#", "#", "#", "#", ".", "#"};
+    static const char *const question[] = {".##.", "#..#", "...#", "..#.", "....", "..#."};
+    static const char *const heart[] = {".##.##.", "#######", "#######", ".#####.", "..###..", "...#..."};
+    static const char *const check[] = {".......##", "......##.", "#....##..", ".#..##...", "..####...", "...##...."};
+    static const char *const yawn[] = {".###.", "#...#", "#...#", "#...#", ".###."};
+    static const char *const zed[] = {"###", ".#.", "###"};
+    static const int ring[12][2] = {{0, 0}, {1, 0}, {2, 0}, {3, 0}, {3, 1}, {3, 2}, {3, 3}, {2, 3}, {1, 3}, {0, 3}, {0, 2}, {0, 1}};
+    static const char *const cheekLeft[] = {"#.", ".#"};
+    static const char *const cheekRight[] = {".#", "#."};
+
+    VoltScreenGrid grid;
+    memset(&grid, 0, sizeof grid);
+    VoltPutGlyph(&grid, cheekLeft, 2, 1, 8, 'o', 0, 0, NO);
+    VoltPutGlyph(&grid, cheekRight, 2, 12, 8, 'o', 0, 0, NO);
+    switch (face) {
+        case VoltFacePrompt:
+            VoltPutGlyph(&grid, chevron, 5, 3, 3, '#', lookX, lookY, glitch);
+            if (cursorOn) VoltPutGlyph(&grid, cursor, 1, 7, 7, '#', lookX, lookY, glitch);
+            break;
+        case VoltFaceDots:
+            VoltPutGlyph(&grid, chevron, 5, 3, 3, '#', lookX, lookY, glitch);
+            for (int i = 0; i < step && i < 3; i++) VoltPutGlyph(&grid, dot, 2, 7 + 2 * i, 6, '#', lookX, lookY, glitch);
+            break;
+        case VoltFaceAlert:
+            VoltPutGlyph(&grid, chevron, 5, 3, 3, '#', lookX, lookY, glitch);
+            VoltPutGlyph(&grid, bang, 6, 10, 2, 'o', lookX, lookY, glitch);
+            break;
+        case VoltFaceQuestion:
+            VoltPutGlyph(&grid, chevron, 5, 3, 3, '#', lookX, lookY, glitch);
+            VoltPutGlyph(&grid, question, 6, 8, 2, '#', lookX, lookY, glitch);
+            break;
+        case VoltFaceHeart:
+            VoltPutGlyph(&grid, heart, 6, 4, 2, 'p', lookX, lookY, glitch);
+            break;
+        case VoltFaceCheck:
+            VoltPutGlyph(&grid, check, 6, 3, 2, '#', lookX, lookY, glitch);
+            break;
+        case VoltFaceYawn:
+            VoltPutGlyph(&grid, yawn, 5, 5, 3, '#', lookX, lookY, glitch);
+            break;
+        case VoltFaceSleep:
+            if (step <= 2 || step == 3) {
+                if (step != 3) VoltPutGlyph(&grid, zed, 3, 3, 6, 'd', 0, 0, NO);
+                if (step >= 1) VoltPutGlyph(&grid, zed, 3, 6, 4, 'd', 0, 0, NO);
+                if (step >= 2) VoltPutGlyph(&grid, zed, 3, 9, 2, 'd', 0, 0, NO);
+            }
+            break;
+        case VoltFaceThink: {
+            // A comet orbiting a ring: bright head, two fading tail pixels.
+            const char shades[3] = {'v', 'w', 'x'};
+            for (int tail = 2; tail >= 0; tail--) {
+                const int *cell = ring[((step - tail) % 12 + 12) % 12];
+                grid.cells[3 + cell[1]][5 + cell[0]] = shades[tail];
+            }
+            break;
+        }
+    }
+    return grid;
 }
 
 static NSInteger NextSelectionIndex(NSInteger current, NSInteger delta, NSInteger count) {
@@ -1054,21 +1250,57 @@ static NSString *ThumbnailCacheKey(NSString *path, NSSize size) {
 @property NSView *dropOverlay;
 @end
 
+// Draws Volt's animated pixel screen over the art, so it must live inside his view and
+// scale with it. Never takes mouse events.
+@interface VoltScreenView : NSView
+@property(nonatomic) VoltScreenSpec spec;
+@property(nonatomic) VoltFace face;
+@property(nonatomic) int dotCount;
+@property(nonatomic) BOOL cursorOn;
+@property(nonatomic) BOOL glitch;
+@property(nonatomic) int lookX;
+@property(nonatomic) int lookY;
+- (void)setFace:(VoltFace)face dotCount:(int)dots cursorOn:(BOOL)cursorOn glitch:(BOOL)glitch lookX:(int)lookX lookY:(int)lookY;
+@end
+
+// A short burst of pixel sparks, drawn over the whole tab so it can spill past Volt.
+@interface VoltSparkView : NSView
+- (void)burstAt:(NSPoint)point count:(NSInteger)count;
+- (void)step:(NSTimeInterval)dt;
+- (void)clear;
+- (BOOL)isActive;
+@end
+
 @interface MascotDropImageView : NSImageView <NSDraggingDestination>
 @property(nonatomic, weak) CompactTabView *dropTarget;
+@property(nonatomic, weak) VoltSparkView *sparkView;
+@property(nonatomic, strong) VoltScreenView *screenView;
 @property(nonatomic) BOOL idleAnimating;
+@property(nonatomic) BOOL hasScreen;
 @property(nonatomic, strong) NSTimer *idleTimer;
+@property(nonatomic) NSTimeInterval timerInterval;
 @property(nonatomic) NSRect restFrame;
 @property(nonatomic) NSTimeInterval animationClock;
 @property(nonatomic) NSTimeInterval gestureStart;
 @property(nonatomic) NSTimeInterval nextGestureAt;
 @property(nonatomic) NSInteger gestureKind;
+@property(nonatomic) VoltFace face;
+@property(nonatomic) NSTimeInterval faceStart;
+@property(nonatomic) NSTimeInterval faceUntil;
+@property(nonatomic) NSTimeInterval nextFaceAt;
+@property(nonatomic) NSTimeInterval glitchUntil;
+@property(nonatomic) CGFloat lean;
+@property(nonatomic) NSTimeInterval lastActivity;
 - (void)startIdleAnimation;
 - (void)stopIdleAnimation;
 - (void)tickIdleAnimation;
+- (void)setArt:(NSImage *)image screen:(const VoltScreenSpec *)spec within:(NSRect)box;
 - (void)playGesture:(NSInteger)kind;
 - (void)playCatchPop;
 - (void)playSuccessHop;
+- (void)playStartle;
+- (void)playHappyHop;
+- (void)setThinking:(BOOL)thinking;
 @end
 
 @interface CompactTabView : NSView <NSDraggingDestination>
@@ -1653,6 +1885,8 @@ static NSString *PackContextSummaryForAssets(NSArray<NSMutableDictionary *> *ass
 @property NSMutableDictionary *previewedAsset;
 @property NSURL *previewedQRURL;
 @property NSTextView *previewNoteTextView;
+@property BOOL noteLastEditWasDelimiter;
+@property BOOL noteAutocorrecting;
 @property NSTimer *previewNoteSaveTimer;
 @property NSPanel *composeNotePanel;
 @property NSTextField *composeNoteTitleField;
@@ -1701,6 +1935,9 @@ static NSString *PackContextSummaryForAssets(NSArray<NSMutableDictionary *> *ass
 - (BOOL)addFromPasteboard:(NSPasteboard *)pasteboard;
 - (NSURL *)storeFileInSelectedPack:(NSURL *)url;
 - (void)uploadFile:(id)sender;
+- (void)exportPackAsZip:(id)sender;
+- (void)emailPackAsZip:(id)sender;
+- (void)exportSelectedAssetsAsZip:(id)sender;
 - (void)paste:(id)sender;
 - (void)grabLink:(id)sender;
 - (void)savePhotoFromLink:(id)sender;
@@ -2285,6 +2522,145 @@ static NSString *PackContextSummaryForAssets(NSArray<NSMutableDictionary *> *ass
 }
 @end
 
+static NSSize VoltArtPixelSize(NSImage *image) {
+    NSImageRep *rep = image.representations.firstObject;
+    if (rep.pixelsWide > 0 && rep.pixelsHigh > 0) return NSMakeSize(rep.pixelsWide, rep.pixelsHigh);
+    return image.size;
+}
+
+// The largest rect with the art's aspect ratio that fits `box`, centred in it. Volt's
+// frame must match the art exactly because squash and stretch scale the image on each
+// axis independently.
+static NSRect VoltFitRect(NSSize art, NSRect box) {
+    if (art.width <= 0 || art.height <= 0) return box;
+    CGFloat scale = MIN(box.size.width / art.width, box.size.height / art.height);
+    CGFloat w = art.width * scale, h = art.height * scale;
+    return NSMakeRect(NSMidX(box) - w / 2, box.origin.y + (box.size.height - h) / 2, w, h);
+}
+
+@implementation VoltScreenView
+- (NSView *)hitTest:(NSPoint)point { return nil; }
+
+- (void)setFace:(VoltFace)face dotCount:(int)dots cursorOn:(BOOL)cursorOn glitch:(BOOL)glitch lookX:(int)lookX lookY:(int)lookY {
+    if (_face == face && _dotCount == dots && _cursorOn == cursorOn && _glitch == glitch && _lookX == lookX && _lookY == lookY) return;
+    _face = face; _dotCount = dots; _cursorOn = cursorOn; _glitch = glitch; _lookX = lookX; _lookY = lookY;
+    self.needsDisplay = YES;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    VoltScreenSpec spec = self.spec;
+    if (spec.artW <= 0 || spec.artH <= 0) return;
+    NSGraphicsContext *context = NSGraphicsContext.currentContext;
+    [context saveGraphicsState];
+
+    // Work in the art's pixel space with y pointing down, like the screen's own grid.
+    NSAffineTransform *transform = [NSAffineTransform transform];
+    [transform translateXBy:0 yBy:NSHeight(self.bounds)];
+    [transform scaleXBy:NSWidth(self.bounds) / spec.artW yBy:-NSHeight(self.bounds) / spec.artH];
+    [transform translateXBy:spec.anchorX yBy:spec.anchorY];
+    [transform rotateByDegrees:-spec.angle];
+    [transform scaleBy:spec.cell];
+    [transform concat];
+
+    // Cells are measured from the anchor: the cheek marks sit at columns 2 and 13, rows 8-9.
+    NSRect cover = NSMakeRect(-6.8, -7.0, 13.6, 8.3);
+    NSBezierPath *glass = [NSBezierPath bezierPathWithRoundedRect:cover xRadius:1.0 yRadius:1.0];
+    NSGradient *gradient = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithCalibratedRed:0.085 green:0.095 blue:0.10 alpha:1]
+                                                         endingColor:[NSColor colorWithCalibratedRed:0.035 green:0.04 blue:0.045 alpha:1]];
+    [gradient drawInBezierPath:glass angle:90];
+    [glass addClip];
+
+    VoltScreenGrid grid = VoltScreenForFace(self.face, self.dotCount, self.cursorOn, self.lookX, self.lookY, self.glitch);
+    NSColor *mint = [NSColor colorWithCalibratedRed:0.36 green:0.95 blue:0.80 alpha:1];
+    NSColor *orange = [NSColor colorWithCalibratedRed:1.0 green:0.67 blue:0.22 alpha:1];
+    NSColor *pink = [NSColor colorWithCalibratedRed:1.0 green:0.48 blue:0.62 alpha:1];
+    NSColor *dim = [NSColor colorWithCalibratedRed:0.22 green:0.55 blue:0.48 alpha:1];
+    NSColor *purple = [NSColor colorWithCalibratedRed:0.66 green:0.48 blue:1.0 alpha:1];
+    NSColor *purpleMid = [NSColor colorWithCalibratedRed:0.46 green:0.34 blue:0.76 alpha:1];
+    NSColor *purpleLow = [NSColor colorWithCalibratedRed:0.30 green:0.24 blue:0.50 alpha:1];
+    for (int pass = 0; pass < 2; pass++) {
+        for (int r = 0; r < VoltScreenRows; r++) {
+            for (int c = 0; c < VoltScreenCols; c++) {
+                char cell = grid.cells[r][c];
+                if (!cell) continue;
+                NSColor *color = mint;
+                switch (cell) {
+                    case 'o': color = orange; break;
+                    case 'p': color = pink; break;
+                    case 'd': color = dim; break;
+                    case 'v': color = purple; break;
+                    case 'w': color = purpleMid; break;
+                    case 'x': color = purpleLow; break;
+                    default: break;
+                }
+                // First pass is a soft halo, second the crisp pixel.
+                CGFloat grow = pass == 0 ? 0.45 : -0.04;
+                [[color colorWithAlphaComponent:pass == 0 ? 0.20 : 1.0] setFill];
+                NSRectFill(NSMakeRect(c - 7.5 - grow, r - 9 - grow, 1 + 2 * grow, 1 + 2 * grow));
+            }
+        }
+    }
+    [context restoreGraphicsState];
+}
+@end
+
+typedef struct { CGFloat x, y, vx, vy, life, span, size; int tint; } VoltSpark;
+enum { VoltSparkMax = 28 };
+
+@implementation VoltSparkView {
+    VoltSpark _sparks[VoltSparkMax];
+    NSInteger _count;
+}
+- (NSView *)hitTest:(NSPoint)point { return nil; }
+
+- (BOOL)isActive { return _count > 0; }
+
+- (void)clear {
+    _count = 0;
+    self.needsDisplay = YES;
+}
+
+- (void)burstAt:(NSPoint)point count:(NSInteger)count {
+    for (NSInteger i = 0; i < count && _count < VoltSparkMax; i++) {
+        CGFloat angle = arc4random_uniform(360) * M_PI / 180;
+        CGFloat speed = 45 + arc4random_uniform(60);
+        _sparks[_count++] = (VoltSpark){
+            point.x, point.y, cos(angle) * speed, sin(angle) * speed + 30,
+            0, 0.55 + arc4random_uniform(30) / 100.0, 1.6 + arc4random_uniform(16) / 10.0, (int)arc4random_uniform(3)
+        };
+    }
+    self.needsDisplay = YES;
+}
+
+- (void)step:(NSTimeInterval)dt {
+    if (!_count) return;
+    for (NSInteger i = 0; i < _count;) {
+        VoltSpark *spark = &_sparks[i];
+        spark->life += dt;
+        spark->vy -= 150 * dt;
+        spark->x += spark->vx * dt;
+        spark->y += spark->vy * dt;
+        if (spark->life >= spark->span) _sparks[i] = _sparks[--_count];
+        else i++;
+    }
+    self.needsDisplay = YES;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    NSColor *tints[3] = {
+        [NSColor colorWithCalibratedRed:0.36 green:0.95 blue:0.80 alpha:1],
+        [NSColor colorWithCalibratedRed:1.0 green:0.82 blue:0.30 alpha:1],
+        [NSColor colorWithCalibratedRed:1.0 green:1.0 blue:0.95 alpha:1]
+    };
+    for (NSInteger i = 0; i < _count; i++) {
+        VoltSpark spark = _sparks[i];
+        CGFloat fade = 1 - spark.life / spark.span;
+        [[tints[spark.tint] colorWithAlphaComponent:fade * fade] setFill];
+        NSRectFill(NSMakeRect(spark.x - spark.size / 2, spark.y - spark.size / 2, spark.size, spark.size));
+    }
+}
+@end
+
 @implementation MascotDropImageView
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
@@ -2293,6 +2669,11 @@ static NSString *PackContextSummaryForAssets(NSArray<NSMutableDictionary *> *ass
         self.allowsCutCopyPaste = NO;
         _restFrame = frameRect;
         _gestureKind = VoltGestureNone;
+        _timerInterval = 1.0 / 30.0;
+        _screenView = [[VoltScreenView alloc] initWithFrame:self.bounds];
+        _screenView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        _screenView.hidden = YES;
+        [self addSubview:_screenView];
         [self registerForDraggedTypes:AcceptedDropTypes()];
     }
     return self;
@@ -2307,16 +2688,42 @@ static NSString *PackContextSummaryForAssets(NSArray<NSMutableDictionary *> *ass
     if (!self.idleAnimating) self.frame = restFrame;
 }
 
+// Swaps the pose art. `spec` says where the animated screen sits on it (NULL: leave the
+// baked-in screen alone, as the catching pose's screen is at too steep an angle to redraw).
+- (void)setArt:(NSImage *)image screen:(const VoltScreenSpec *)spec within:(NSRect)box {
+    self.image = image;
+    self.restFrame = VoltFitRect(VoltArtPixelSize(image), box);
+    self.hasScreen = spec != NULL;
+    if (spec) self.screenView.spec = *spec;
+    [self updateScreenVisibility];
+}
+
+- (void)updateScreenVisibility {
+    self.screenView.hidden = !(self.idleAnimating && self.hasScreen);
+}
+
+- (void)scheduleTimerWithInterval:(NSTimeInterval)interval {
+    [self.idleTimer invalidate];
+    self.timerInterval = interval;
+    __weak MascotDropImageView *weakSelf = self;
+    self.idleTimer = [NSTimer scheduledTimerWithTimeInterval:interval repeats:YES block:^(__unused NSTimer *timer) {
+        [weakSelf tickIdleAnimation];
+    }];
+}
+
 - (void)startIdleAnimation {
     self.idleAnimating = YES;
+    [self updateScreenVisibility];
     if (self.idleTimer) return;
     self.animationClock = 0;
     self.gestureKind = VoltGestureNone;
-    self.nextGestureAt = 6.0 + (arc4random_uniform(700) / 100.0);
-    __weak MascotDropImageView *weakSelf = self;
-    self.idleTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 30.0 repeats:YES block:^(__unused NSTimer *timer) {
-        [weakSelf tickIdleAnimation];
-    }];
+    self.face = VoltFacePrompt;
+    self.glitchUntil = 0;
+    self.lean = 0;
+    self.nextGestureAt = 2.0 + (arc4random_uniform(200) / 100.0);
+    self.nextFaceAt = 1.2;
+    self.lastActivity = 0;
+    [self scheduleTimerWithInterval:1.0 / 30.0];
 }
 
 - (void)stopIdleAnimation {
@@ -2324,33 +2731,164 @@ static NSString *PackContextSummaryForAssets(NSArray<NSMutableDictionary *> *ass
     [self.idleTimer invalidate];
     self.idleTimer = nil;
     self.gestureKind = VoltGestureNone;
+    [self.sparkView clear];
+    [self updateScreenVisibility];
     self.frame = self.restFrame;
 }
 
+- (void)setFace:(VoltFace)face for:(NSTimeInterval)duration {
+    self.face = face;
+    self.faceStart = self.animationClock;
+    self.faceUntil = self.animationClock + duration;
+}
+
+// Where the cursor is relative to Volt, as a lean in [-1, 1] and a look direction in
+// screen cells. Beyond ~320pt he ignores it.
+- (void)updateLook:(int *)lookX y:(int *)lookY {
+    *lookX = 0;
+    *lookY = 0;
+    CGFloat target = 0;
+    if (self.window) {
+        NSPoint mouse = NSEvent.mouseLocation;
+        NSRect frame = self.window.frame;
+        CGFloat dx = mouse.x - NSMidX(frame), dy = mouse.y - NSMidY(frame);
+        CGFloat distance = hypot(dx, dy);
+        if (distance < 150) {
+            // He notices someone close by, and wakes up if he was napping.
+            self.lastActivity = self.animationClock;
+            if (self.gestureKind == VoltGestureSleep) {
+                self.nextGestureAt = MAX(self.nextGestureAt, self.animationClock + 3);
+                [self playGesture:VoltGestureStartle];
+            }
+        }
+        if (distance < 320) {
+            target = MIN(MAX(dx / 160, -1), 1);
+            *lookX = dx > 50 ? 1 : dx < -50 ? -1 : 0;
+            *lookY = dy > 50 ? -1 : dy < -50 ? 1 : 0;
+        }
+    }
+    self.lean += (target - self.lean) * 0.15;
+}
+
 - (void)tickIdleAnimation {
-    self.animationClock += 1.0 / 30.0;
-    if (self.gestureKind != VoltGestureNone && self.animationClock - self.gestureStart >= VoltGestureDuration) {
+    NSTimeInterval now = (self.animationClock += self.timerInterval);
+    if (self.gestureKind != VoltGestureNone && now - self.gestureStart >= VoltGestureDuration(self.gestureKind)) {
         self.gestureKind = VoltGestureNone;
     }
-    if (self.gestureKind == VoltGestureNone && self.animationClock >= self.nextGestureAt) {
-        [self playGesture:(NSInteger)arc4random_uniform(3)];
-        self.nextGestureAt = self.animationClock + 6.0 + (arc4random_uniform(700) / 100.0);
+    // A request that never reports back must not leave him thinking forever.
+    if (self.gestureKind == VoltGestureThink && now - self.gestureStart > 120) {
+        self.gestureKind = VoltGestureNone;
+        self.face = VoltFacePrompt;
     }
-    NSTimeInterval elapsed = self.gestureKind == VoltGestureNone ? -1 : self.animationClock - self.gestureStart;
-    self.frame = VoltIdleFrame(self.restFrame, self.animationClock, elapsed, self.gestureKind);
+    if (self.gestureKind == VoltGestureNone && now >= self.nextGestureAt) {
+        static const NSInteger pool[] = {VoltGestureHop, VoltGestureWobble, VoltGestureYawn, VoltGestureLookAround, VoltGestureSquash};
+        [self playGesture:pool[arc4random_uniform(5)]];
+        self.nextGestureAt = now + 3.5 + (arc4random_uniform(300) / 100.0);
+    }
+    if (self.gestureKind == VoltGestureNone && now - self.lastActivity > 60) [self playGesture:VoltGestureSleep];
+
+    if (self.face != VoltFacePrompt && now >= self.faceUntil) self.face = VoltFacePrompt;
+    if (self.face == VoltFacePrompt && self.gestureKind == VoltGestureNone && now >= self.nextFaceAt) {
+        uint32_t roll = arc4random_uniform(5);
+        if (roll < 2) [self setFace:VoltFaceDots for:1.7];
+        else if (roll < 3) [self setFace:VoltFaceQuestion for:1.3];
+        else self.glitchUntil = now + 0.14;
+        self.nextFaceAt = now + 3.0 + (arc4random_uniform(400) / 100.0);
+    }
+    int lookX, lookY;
+    [self updateLook:&lookX y:&lookY];
+    if (self.gestureKind == VoltGestureLookAround) {
+        // Glances left, then right, then settles.
+        CGFloat u = (now - self.gestureStart) / VoltGestureDuration(VoltGestureLookAround);
+        lookX = u < 0.25 ? 0 : u < 0.5 ? -1 : u < 0.8 ? 1 : 0;
+        lookY = 0;
+    } else if (self.gestureKind == VoltGestureSleep || self.gestureKind == VoltGestureThink) {
+        lookX = 0;
+        lookY = 0;
+    }
+    int step = (int)((now - self.faceStart) / 0.3) % 4;
+    if (self.face == VoltFaceThink) step = (int)(now / 0.07) % 12;
+    else if (self.face == VoltFaceSleep) step = (int)(now / 0.6) % 4;
+    [self.screenView setFace:self.face
+                    dotCount:step
+                    cursorOn:fmod(now, 1.1) < 0.62
+                      glitch:now < self.glitchUntil
+                       lookX:lookX
+                       lookY:lookY];
+
+    NSTimeInterval elapsed = self.gestureKind == VoltGestureNone ? -1 : now - self.gestureStart;
+    self.frame = VoltIdleFrame(self.restFrame, now, elapsed, self.gestureKind, self.lean);
+    [self.sparkView step:self.timerInterval];
+
+    // Motion needs smoother frames than breathing does, and a napping Volt needs fewer.
+    BOOL moving = self.gestureKind != VoltGestureNone && self.gestureKind != VoltGestureThink && self.gestureKind != VoltGestureSleep;
+    NSTimeInterval want = (moving || self.sparkView.isActive) ? 1.0 / 60.0 : self.gestureKind == VoltGestureSleep ? 1.0 / 15.0 : 1.0 / 30.0;
+    if (fabs(want - self.timerInterval) > 1e-6) [self scheduleTimerWithInterval:want];
 }
 
 - (void)playGesture:(NSInteger)kind {
     self.gestureKind = kind;
     self.gestureStart = self.animationClock;
+    switch (kind) {
+        case VoltGestureHop: [self setFace:VoltFaceAlert for:0.7]; break;
+        case VoltGestureWobble: [self setFace:VoltFaceHeart for:1.2]; break;
+        case VoltGestureCheer: [self setFace:VoltFaceCheck for:1.4]; break;
+        case VoltGestureStartle: [self setFace:VoltFaceAlert for:1.0]; break;
+        case VoltGestureYawn: [self setFace:VoltFaceYawn for:VoltGestureDuration(kind)]; break;
+        case VoltGestureLookAround: [self setFace:VoltFaceQuestion for:VoltGestureDuration(kind)]; break;
+        case VoltGestureThink: [self setFace:VoltFaceThink for:INFINITY]; break;
+        case VoltGestureSleep: [self setFace:VoltFaceSleep for:INFINITY]; break;
+        default: break;
+    }
+}
+
+// Something the user did: counts against napping, wakes him, and holds off the next
+// idle gesture so it doesn't talk over the reaction.
+- (void)noteActivity {
+    self.lastActivity = self.animationClock;
+    if (self.gestureKind == VoltGestureSleep) self.gestureKind = VoltGestureNone;
+    self.nextGestureAt = MAX(self.nextGestureAt, self.animationClock + 3);
+}
+
+// While Pack AI is working he keeps thinking, and ignores nudges that would interrupt it.
+- (BOOL)isThinking {
+    return self.gestureKind == VoltGestureThink;
+}
+
+- (void)setThinking:(BOOL)thinking {
+    if (!self.idleAnimating) return;
+    if (thinking && !self.isThinking) {
+        [self noteActivity];
+        [self playGesture:VoltGestureThink];
+    } else if (!thinking && self.isThinking) {
+        self.gestureKind = VoltGestureNone;
+        self.face = VoltFacePrompt;
+    }
 }
 
 - (void)playCatchPop {
+    if (self.isThinking) return;
+    [self noteActivity];
     [self playGesture:VoltGestureSquash];
 }
 
 - (void)playSuccessHop {
+    [self noteActivity];
+    [self playGesture:VoltGestureCheer];
+    [self.sparkView burstAt:NSMakePoint(NSMidX(self.restFrame), NSMinY(self.restFrame) + NSHeight(self.restFrame) * 0.55) count:16];
+}
+
+- (void)playStartle {
+    if (self.isThinking) return;
+    [self noteActivity];
+    [self playGesture:VoltGestureStartle];
+}
+
+- (void)playHappyHop {
+    if (self.isThinking) return;
+    [self noteActivity];
     [self playGesture:VoltGestureHop];
+    [self setFace:VoltFaceHeart for:1.0];
 }
 
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender { return [self.dropTarget draggingEntered:sender]; }
@@ -2438,11 +2976,18 @@ static NSString *PackContextSummaryForAssets(NSArray<NSMutableDictionary *> *ass
     self.successMascot = BundledPNG(@"volt-mascot-success");
     self.mascotView = [[MascotDropImageView alloc] initWithFrame:NSMakeRect(16, 13, 71, 66)];
     self.mascotView.dropTarget = self;
-    self.mascotView.imageScaling = NSImageScaleProportionallyUpOrDown;
+    // Squash and stretch resize his frame on each axis, so the art has to stretch with it;
+    // setArt: gives him a frame that matches the art's aspect ratio.
+    self.mascotView.imageScaling = NSImageScaleAxesIndependently;
     self.mascotView.imageAlignment = NSImageAlignCenter;
-    self.mascotView.image = self.idleMascot;
+    [self.mascotView setArt:self.idleMascot screen:self.idleMascot ? &VoltIdleScreenSpec : NULL within:NSMakeRect(16, 13, 71, 66)];
     self.mascotView.toolTip = @"Drag Volt to move. Drop a file to save it.";
     [self addSubview:self.mascotView];
+
+    VoltSparkView *sparks = [[VoltSparkView alloc] initWithFrame:self.bounds];
+    sparks.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [self addSubview:sparks];
+    self.mascotView.sparkView = sparks;
     return self;
 }
 
@@ -2458,8 +3003,7 @@ static NSString *PackContextSummaryForAssets(NSArray<NSMutableDictionary *> *ass
 
 - (void)refresh {
     if (!self.controller) return;
-    self.mascotView.image = self.idleMascot ?: AppIconImage();
-    self.mascotView.restFrame = NSMakeRect(16, 13, 71, 66);
+    [self.mascotView setArt:self.idleMascot ?: AppIconImage() screen:self.idleMascot ? &VoltIdleScreenSpec : NULL within:NSMakeRect(16, 13, 71, 66)];
     self.mascotView.toolTip = [NSString stringWithFormat:@"%@. Click to open. Right-click for actions. Drop to save.", self.controller.currentPackName];
     if ([self voltAnimationsOn]) [self.mascotView startIdleAnimation];
     else [self.mascotView stopIdleAnimation];
@@ -2468,8 +3012,7 @@ static NSString *PackContextSummaryForAssets(NSArray<NSMutableDictionary *> *ass
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
     NSDragOperation operation = AcceptedDragOperation(sender);
     if (operation != NSDragOperationNone) {
-        self.mascotView.image = self.catchMascot ?: self.idleMascot;
-        self.mascotView.restFrame = NSMakeRect(14, 13, 75, 65);
+        [self.mascotView setArt:self.catchMascot ?: self.idleMascot screen:NULL within:NSMakeRect(14, 13, 75, 65)];
         self.mascotView.toolTip = [NSString stringWithFormat:@"Drop into %@", self.controller.currentPackName];
         if ([self voltAnimationsOn]) [self.mascotView playCatchPop];
     }
@@ -2485,14 +3028,14 @@ static NSString *PackContextSummaryForAssets(NSArray<NSMutableDictionary *> *ass
     if (!added) {
         [self.controller showTransientNotice:@"Could not read that drop"];
         [self refresh];
+        if ([self voltAnimationsOn]) [self.mascotView playStartle];
         return NO;
     }
-    self.mascotView.image = self.successMascot ?: self.idleMascot;
-    self.mascotView.restFrame = NSMakeRect(16, 13, 71, 66);
+    [self.mascotView setArt:self.successMascot ?: self.idleMascot screen:&VoltSuccessScreenSpec within:NSMakeRect(16, 13, 71, 66)];
     self.mascotView.toolTip = @"Saved";
     if ([self voltAnimationsOn]) [self.mascotView playSuccessHop];
     __weak CompactTabView *weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [weakSelf refresh];
     });
     return added;
@@ -2546,6 +3089,7 @@ static NSString *PackContextSummaryForAssets(NSArray<NSMutableDictionary *> *ass
         [self.controller showVoltQuickMenu:self];
         return;
     }
+    if ([self voltAnimationsOn]) [self.mascotView playHappyHop];
     [self.controller togglePanel];
 }
 
@@ -4423,7 +4967,57 @@ static OSStatus HotKeyHandler(__unused EventHandlerCallRef nextHandler, EventRef
     [self saveState];
 }
 
+// Native autocorrect only underlines (you had to find the word and pick a
+// fix). This does what a phone keyboard does: the moment you type a space or
+// punctuation after a word, a confident correction is swapped in
+// automatically. Deliberately conservative so it can't mangle code/SQL notes:
+// only plain lowercase or Capitalized letter-runs (never ALL CAPS, snake_case
+// or anything touching digits), and only when the spell checker offers a real
+// autocorrection (it returns none for valid words, so SELECT/FROM etc. pass).
+- (BOOL)textView:(NSTextView *)textView shouldChangeTextInRange:(NSRange)range replacementString:(NSString *)string {
+    self.noteLastEditWasDelimiter = string.length == 1 &&
+        ([NSCharacterSet.whitespaceAndNewlineCharacterSet characterIsMember:[string characterAtIndex:0]] || [@".,;:!?" containsString:string]);
+    return YES;
+}
+
+- (void)autocorrectWordBeforeCursorInTextView:(NSTextView *)textView {
+    NSString *text = textView.string;
+    NSRange selection = textView.selectedRange;
+    NSUInteger cursor = selection.location;
+    if (selection.length || cursor < 2 || cursor > text.length) return;
+    NSUInteger end = cursor - 1;
+    NSUInteger start = end;
+    while (start > 0 && [NSCharacterSet.letterCharacterSet characterIsMember:[text characterAtIndex:start - 1]]) start--;
+    if (end - start < 3) return;
+    if (start > 0) {
+        unichar before = [text characterAtIndex:start - 1];
+        if ([NSCharacterSet.alphanumericCharacterSet characterIsMember:before] || before == '_') return;
+    }
+    NSRange wordRange = NSMakeRange(start, end - start);
+    NSString *word = [text substringWithRange:wordRange];
+    if (![word isEqualToString:word.lowercaseString] && ![word isEqualToString:word.capitalizedString]) return;
+
+    NSSpellChecker *checker = NSSpellChecker.sharedSpellChecker;
+    NSInteger tag = textView.spellCheckerDocumentTag;
+    NSString *fix = [checker correctionForWordRange:wordRange inString:text language:checker.language inSpellDocumentWithTag:tag];
+    if (!fix.length || [fix isEqualToString:word]) return;
+
+    // insertText:replacementRange: keeps undo working; the cursor has to be
+    // put back after the delimiter since it lands right after the new word.
+    NSUInteger tail = text.length - cursor;
+    self.noteAutocorrecting = YES;
+    [textView insertText:fix replacementRange:wordRange];
+    textView.selectedRange = NSMakeRange(textView.string.length - tail, 0);
+    self.noteAutocorrecting = NO;
+}
+
 - (void)textDidChange:(NSNotification *)notification {
+    NSTextView *changed = notification.object;
+    BOOL wasDelimiter = self.noteLastEditWasDelimiter;
+    self.noteLastEditWasDelimiter = NO;
+    if (wasDelimiter && !self.noteAutocorrecting && (changed == self.previewNoteTextView || changed == self.composeNoteBodyView)) {
+        [self autocorrectWordBeforeCursorInTextView:changed];
+    }
     if (notification.object != self.previewNoteTextView) return;
     [self.previewNoteSaveTimer invalidate];
     self.previewNoteSaveTimer = [NSTimer scheduledTimerWithTimeInterval:0.6 target:self selector:@selector(flushPreviewNoteSave) userInfo:nil repeats:NO];
@@ -4534,6 +5128,8 @@ static OSStatus HotKeyHandler(__unused EventHandlerCallRef nextHandler, EventRef
     bodyScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     NSTextView *bodyView = [[NSTextView alloc] initWithFrame:bodyScroll.bounds];
     bodyView.editable = YES;
+    EnableNoteAutocorrect(bodyView);
+    bodyView.delegate = self;
     bodyView.selectable = YES;
     bodyView.drawsBackground = NO;
     bodyView.textColor = [NSColor colorWithCalibratedWhite:0.92 alpha:1];
@@ -5076,6 +5672,7 @@ static OSStatus HotKeyHandler(__unused EventHandlerCallRef nextHandler, EventRef
     pulse.repeatCount = HUGE_VALF;
     pulse.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
     [self.askAIAvatarView.layer addAnimation:pulse forKey:@"thinkingPulse"];
+    [self.compactTabView.mascotView setThinking:YES];
     [self refreshAskAIRimGlow];
     // The Pack window's own perimeter streak is the product-wide "AI is
     // active" signal, not just something inside this panel — it needs to
@@ -5086,6 +5683,7 @@ static OSStatus HotKeyHandler(__unused EventHandlerCallRef nextHandler, EventRef
 
 - (void)endAskAIThinkingIndicator {
     [self.askAIAvatarView.layer removeAnimationForKey:@"thinkingPulse"];
+    [self.compactTabView.mascotView setThinking:NO];
     self.askAIStatusLabel.stringValue = @"Online";
     self.askAIStatusLabel.textColor = [NSColor colorWithCalibratedWhite:0.55 alpha:1];
     [self refreshAskAIRimGlow];
@@ -5240,6 +5838,10 @@ static OSStatus HotKeyHandler(__unused EventHandlerCallRef nextHandler, EventRef
         if (!strongSelf || strongSelf.askAIPanel != panelAtCallTime) return;
         strongSelf.askAIWaitingForResponse = NO;
         [strongSelf endAskAIThinkingIndicator];
+        if (strongSelf.compactTabView.voltAnimationsOn) {
+            if (text.length) [strongSelf.compactTabView.mascotView playSuccessHop];
+            else [strongSelf.compactTabView.mascotView playStartle];
+        }
         NSString *reply = text.length ? [strongSelf executeAskAIActionsInReply:text] : [NSString stringWithFormat:@"Couldn't get an answer: %@", error.length ? error : @"unknown error"];
         NSString *messageID = NSUUID.UUID.UUIDString;
         [strongSelf.askAIMessages addObject:@{ @"role": @"assistant", @"content": reply, @"id": messageID }];
@@ -5597,6 +6199,7 @@ static void DetectQRCodeURLInImage(NSImage *image, void (^completion)(NSURL * _N
         // editing in place and autosaving on a short pause is what makes
         // that possible instead of a separate save step.
         if (isEditableNote) {
+            EnableNoteAutocorrect(textView);
             textView.delegate = self;
             self.previewNoteTextView = textView;
         }
@@ -5940,6 +6543,7 @@ static void DetectQRCodeURLInImage(NSImage *image, void (^completion)(NSURL * _N
         }
     }
     [menu addItem:[self assetMenuItemWithTitle:@"Share…" symbol:@"square.and.arrow.up" action:@selector(shareSelectedAssets:)]];
+    [menu addItem:[self assetMenuItemWithTitle:count > 1 ? [NSString stringWithFormat:@"Export %lu Items as ZIP…", (unsigned long)count] : @"Export as ZIP…" symbol:@"doc.zipper" action:@selector(exportSelectedAssetsAsZip:)]];
     [menu addItem:NSMenuItem.separatorItem];
 
     NSMenuItem *rename = [self assetMenuItemWithTitle:@"Rename…" symbol:@"pencil" action:@selector(renameSelectedAsset:)];
@@ -6010,6 +6614,69 @@ static void DetectQRCodeURLInImage(NSImage *image, void (^completion)(NSURL * _N
     if (!items.count) return;
     NSSharingServicePicker *picker = [[NSSharingServicePicker alloc] initWithItems:items];
     [picker showRelativeToRect:NSMakeRect(NSMidX(self.panel.contentView.bounds), NSMaxY(self.panel.contentView.bounds) - 40, 1, 1) ofView:self.panel.contentView preferredEdge:NSRectEdgeMinY];
+}
+
+// A Pack is a folder, so exporting one zips every asset in it (Trash excluded) into
+// something a recipient can open with no Packs: the real files, notes as .txt, and an
+// index.html page that lists it all.
+- (void)exportPackAsZip:(id)sender {
+    [self exportAssets:[[self selectedPack][@"assets"] copy] named:self.currentPackName email:NO];
+}
+
+- (void)emailPackAsZip:(id)sender {
+    [self exportAssets:[[self selectedPack][@"assets"] copy] named:self.currentPackName email:YES];
+}
+
+- (void)exportSelectedAssetsAsZip:(id)sender {
+    NSArray *assets = [self selectedAssets];
+    if (assets.count) [self exportAssets:assets named:[NSString stringWithFormat:@"%@ selection", self.currentPackName] email:NO];
+}
+
+- (void)exportAssets:(NSArray *)assets named:(NSString *)name email:(BOOL)email {
+    if (!assets.count) {
+        [self showTransientNotice:@"Nothing to export"];
+        return;
+    }
+    NSString *fileName = [ExportSafeFileName(name) stringByAppendingPathExtension:@"zip"];
+    void (^build)(NSURL *) = ^(NSURL *destination) {
+        [self showTransientNotice:@"Zipping…"];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            NSUInteger count = 0, skipped = 0;
+            NSString *error = nil;
+            BOOL ok = BuildPackExportZip(name, assets, destination, &count, &skipped, &error);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (!ok) {
+                    [self showTransientNotice:error ?: @"Could not create the ZIP"];
+                    return;
+                }
+                NSString *size = [NSByteCountFormatter stringFromByteCount:[[NSFileManager.defaultManager attributesOfItemAtPath:destination.path error:nil] fileSize] countStyle:NSByteCountFormatterCountStyleFile];
+                NSString *skippedNote = skipped ? [NSString stringWithFormat:@", %lu missing file%@ skipped", (unsigned long)skipped, skipped == 1 ? @"" : @"s"] : @"";
+                LPPLog(@"pack.exported_zip", @{ @"items": @(count), @"skipped": @(skipped), @"email": @(email) });
+                NSSharingService *mail = email ? [NSSharingService sharingServiceNamed:NSSharingServiceNameComposeEmail] : nil;
+                if (mail && [mail canPerformWithItems:@[destination]]) {
+                    mail.subject = name;
+                    [mail performWithItems:@[destination]];
+                    [self showTransientNotice:[NSString stringWithFormat:@"%lu items zipped (%@) and attached%@", (unsigned long)count, size, skippedNote]];
+                } else {
+                    [NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[destination]];
+                    [self showTransientNotice:[NSString stringWithFormat:@"%lu items zipped (%@)%@", (unsigned long)count, size, skippedNote]];
+                }
+            });
+        });
+    };
+    if (email) {
+        NSString *folder = [NSTemporaryDirectory() stringByAppendingPathComponent:[@"lpp-mail-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+        [NSFileManager.defaultManager createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:nil];
+        build([NSURL fileURLWithPath:[folder stringByAppendingPathComponent:fileName]]);
+        return;
+    }
+    NSSavePanel *panel = [NSSavePanel savePanel];
+    panel.nameFieldStringValue = fileName;
+    panel.allowedContentTypes = @[UTTypeZIP];
+    panel.prompt = @"Export";
+    [panel beginWithCompletionHandler:^(NSModalResponse result) {
+        if (result == NSModalResponseOK && panel.URL) build(panel.URL);
+    }];
 }
 
 - (void)renameSelectedAsset:(id)sender {
@@ -6590,6 +7257,12 @@ static void DetectQRCodeURLInImage(NSImage *image, void (^completion)(NSURL * _N
     [menu addItem:NSMenuItem.separatorItem];
     [menu addItem:[self menuItemWithTitle:@"New Pack…" symbol:@"folder.badge.plus" action:@selector(createPack:)]];
     [menu addItem:[self menuItemWithTitle:@"Copy Pack Link" symbol:@"link" action:@selector(copyShareLink:)]];
+    NSMenuItem *exportZip = [self menuItemWithTitle:@"Export Pack as ZIP…" symbol:@"doc.zipper" action:@selector(exportPackAsZip:)];
+    NSMenuItem *emailZip = [self menuItemWithTitle:@"Email Pack as ZIP…" symbol:@"envelope" action:@selector(emailPackAsZip:)];
+    exportZip.enabled = emailZip.enabled = self.currentAssetCount > 0;
+    exportZip.toolTip = @"Anyone can open it, no Packs needed";
+    [menu addItem:exportZip];
+    [menu addItem:emailZip];
     [menu addItem:NSMenuItem.separatorItem];
     NSMenuItem *pin = [self menuItemWithTitle:@"Keep Pack Open" symbol:@"pin" action:@selector(togglePanelPinned:)];
     pin.state = self.panelPinned ? NSControlStateValueOn : NSControlStateValueOff;
@@ -7395,20 +8068,119 @@ static int RunSelfTests(void) {
     check(ShouldAnimateVolt(YES, NO), @"lets Volt idle-animate when motion is welcome");
     check(!ShouldAnimateVolt(YES, YES), @"holds Volt still when the system asks to reduce motion");
     check(!ShouldAnimateVolt(NO, NO), @"holds Volt still when animation is switched off");
-    NSRect voltRest = NSMakeRect(16, 13, 71, 66);
-    check(NSEqualRects(VoltIdleFrame(voltRest, 0, -1, VoltGestureNone), voltRest), @"leaves Volt at his resting frame");
-    NSRect midHop = VoltIdleFrame(voltRest, 0, VoltGestureDuration / 2, VoltGestureHop);
-    check(NSMinY(midHop) > NSMinY(voltRest) + 6, @"lifts Volt off the ground mid-hop");
-    NSRect squashed = VoltIdleFrame(voltRest, 0, VoltGestureDuration / 2, VoltGestureSquash);
-    check(NSHeight(squashed) < NSHeight(voltRest), @"squashes Volt when he catches a file");
-    check(fabs(NSMidX(squashed) - NSMidX(voltRest)) < 0.001, @"keeps Volt centred while he squashes");
+    NSRect voltRest = NSMakeRect(16, 13, 64, 66);
+    check(NSEqualRects(VoltIdleFrame(voltRest, 0, -1, VoltGestureNone, 0), voltRest), @"leaves Volt at his resting frame");
     BOOL idleStaysSubtle = YES;
     for (NSTimeInterval clock = 0; clock < 12; clock += 0.05) {
-        NSRect breathing = VoltIdleFrame(voltRest, clock, -1, VoltGestureNone);
-        if (fabs(NSMinY(breathing) - NSMinY(voltRest)) > 3.5) idleStaysSubtle = NO;
-        if (fabs(NSMidX(breathing) - NSMidX(voltRest)) > 0.001) idleStaysSubtle = NO;
+        NSRect breathing = VoltIdleFrame(voltRest, clock, -1, VoltGestureNone, 0);
+        if (fabs(NSMinY(breathing) - NSMinY(voltRest)) > 0.001) idleStaysSubtle = NO;
+        if (fabs(NSMidX(breathing) - NSMidX(voltRest)) > 1.5) idleStaysSubtle = NO;
+        if (fabs(NSHeight(breathing) / NSHeight(voltRest) - 1) > 0.03) idleStaysSubtle = NO;
     }
-    check(idleStaysSubtle, @"keeps Volt's idle breathing subtle and centred");
+    check(idleStaysSubtle, @"keeps Volt's idle breathing subtle with his feet planted");
+    check(VoltIdleFrame(voltRest, 0, -1, VoltGestureNone, 1).origin.x > voltRest.origin.x + 2, @"leans Volt toward the cursor");
+
+    for (NSInteger kind = VoltGestureHop; kind <= VoltGestureStartle; kind++) {
+        CGFloat maxLift = 0, minSY = 9, maxSY = 0, maxTop = 0, minBottom = 999;
+        for (NSTimeInterval t = 0; t < VoltGestureDuration(kind); t += 0.01) {
+            NSRect frame = VoltIdleFrame(voltRest, 0, t, kind, 0);
+            maxLift = MAX(maxLift, NSMinY(frame) - NSMinY(voltRest));
+            minSY = MIN(minSY, NSHeight(frame) / NSHeight(voltRest));
+            maxSY = MAX(maxSY, NSHeight(frame) / NSHeight(voltRest));
+            maxTop = MAX(maxTop, NSMaxY(frame));
+            minBottom = MIN(minBottom, NSMinY(frame));
+        }
+        NSString *name = @[@"hop", @"squash", @"wobble", @"cheer", @"startle"][kind];
+        check(minBottom >= NSMinY(voltRest) - 0.001, [NSString stringWithFormat:@"keeps Volt's feet from sinking during a %@", name]);
+        check(maxTop <= 92 + 8, [NSString stringWithFormat:@"keeps Volt inside his window during a %@", name]);
+        if (kind == VoltGestureSquash) check(minSY < 0.85, @"squashes Volt when he catches a file");
+        if (kind == VoltGestureHop || kind == VoltGestureCheer || kind == VoltGestureStartle) {
+            check(maxLift > 6, [NSString stringWithFormat:@"lifts Volt off the ground in a %@", name]);
+            check(minSY < 0.88 && maxSY > 1.08, [NSString stringWithFormat:@"crouches then stretches Volt in a %@", name]);
+        }
+        NSRect landed = VoltIdleFrame(voltRest, 0, VoltGestureDuration(kind) - 0.001, kind, 0);
+        check(fabs(NSHeight(landed) / NSHeight(voltRest) - 1) < 0.03 && fabs(NSMidX(landed) - NSMidX(voltRest)) < 0.5, [NSString stringWithFormat:@"settles Volt back to rest after a %@", name]);
+    }
+
+    VoltPose yawnPeak = VoltGesturePose(VoltGestureYawn, 0.9), yawnEnd = VoltGesturePose(VoltGestureYawn, 1.8);
+    check(yawnPeak.sy > 1.06 && fabs(yawnEnd.sy - 1) < 0.001, @"stretches Volt up in a yawn and lets him back down");
+    check(VoltGesturePose(VoltGestureSleep, 3).sy < 0.96 && VoltGesturePose(VoltGestureSleep, 0).sy == 1, @"slumps Volt lower as he falls asleep");
+    BOOL thinkStaysSmall = YES;
+    for (NSTimeInterval t = 0; t < 10; t += 0.05) {
+        VoltPose think = VoltGesturePose(VoltGestureThink, t);
+        if (fabs(think.sy - 1) > 0.03 || think.lift != 0) thinkStaysSmall = NO;
+    }
+    check(thinkStaysSmall && isinf(VoltGestureDuration(VoltGestureThink)) && isinf(VoltGestureDuration(VoltGestureSleep)), @"keeps Volt's thinking bounce small and open-ended");
+    VoltScreenGrid spin0 = VoltScreenForFace(VoltFaceThink, 0, YES, 0, 0, NO);
+    VoltScreenGrid spin5 = VoltScreenForFace(VoltFaceThink, 5, YES, 0, 0, NO);
+    check(spin0.cells[3][5] == 'v' && spin5.cells[5][8] == 'v' && spin5.cells[4][8] == 'w' && spin5.cells[3][8] == 'x' && spin5.cells[3][5] != 'v', @"orbits the thinking spinner with a fading tail");
+    VoltScreenGrid zz0 = VoltScreenForFace(VoltFaceSleep, 0, YES, 0, 0, NO), zz2 = VoltScreenForFace(VoltFaceSleep, 2, YES, 0, 0, NO);
+    check(zz0.cells[6][3] == 'd' && !zz0.cells[4][6] && zz2.cells[4][6] == 'd' && zz2.cells[2][9] == 'd', @"floats more zzz as Volt sleeps");
+    VoltScreenGrid yawnFace = VoltScreenForFace(VoltFaceYawn, 0, YES, 0, 0, NO);
+    check(yawnFace.cells[3][6] == '#' && !yawnFace.cells[5][7], @"draws an open mouth when Volt yawns");
+
+    int litPrompt = 0, litCursorOff = 0, orangeCells = 0;
+    VoltScreenGrid prompt = VoltScreenForFace(VoltFacePrompt, 0, YES, 0, 0, NO);
+    VoltScreenGrid noCursor = VoltScreenForFace(VoltFacePrompt, 0, NO, 0, 0, NO);
+    for (int r = 0; r < VoltScreenRows; r++) for (int c = 0; c < VoltScreenCols; c++) {
+        if (prompt.cells[r][c] == '#') litPrompt++;
+        if (noCursor.cells[r][c] == '#') litCursorOff++;
+        if (prompt.cells[r][c] == 'o') orangeCells++;
+    }
+    check(litPrompt == litCursorOff + 4 && orangeCells == 4, @"blinks Volt's prompt cursor and keeps his cheeks");
+    VoltScreenGrid looking = VoltScreenForFace(VoltFacePrompt, 0, YES, 1, 0, NO);
+    check(looking.cells[3][4] == '#' && prompt.cells[3][3] == '#' && looking.cells[8][1] == 'o', @"shifts Volt's prompt toward the cursor but not his cheeks");
+    VoltScreenGrid dots = VoltScreenForFace(VoltFaceDots, 2, YES, 0, 0, NO);
+    check(dots.cells[6][7] == '#' && dots.cells[6][9] == '#' && !dots.cells[6][11], @"types Volt's dots one at a time");
+    VoltScreenGrid heart = VoltScreenForFace(VoltFaceHeart, 0, YES, 0, 0, NO);
+    check(heart.cells[3][5] == 'p', @"shows a pink heart on Volt's screen");
+    VoltScreenGrid edge = VoltScreenForFace(VoltFaceCheck, 0, YES, -1, -1, YES);
+    check(edge.cells[8][1] == 'o', @"keeps shifted screen pixels inside the grid");
+    check(NSEqualRects(VoltFitRect(NSMakeSize(100, 200), NSMakeRect(0, 0, 100, 100)), NSMakeRect(25, 0, 50, 100)), @"fits Volt's frame to his art's aspect ratio");
+
+    check([ExportSafeFileName(@"Q3/plan: v2?") isEqualToString:@"Q3-plan- v2-"] && [ExportSafeFileName(@"  ..  ") isEqualToString:@"Untitled"], @"cleans names that can't live in a ZIP");
+    NSMutableSet<NSString *> *usedNames = [NSMutableSet set];
+    NSString *firstName = ExportUniqueName(@"Logo.png", usedNames), *secondName = ExportUniqueName(@"logo.PNG", usedNames);
+    check([firstName isEqualToString:@"Logo.png"] && [secondName isEqualToString:@"logo 2.PNG"], @"keeps exported file names unique");
+    NSString *exportPage = PackExportIndexHTML(@"A <b>&</b> B", @[
+        @{@"title": @"Shot", @"kind": @"Image", @"file": @"files/My Shot.png", @"image": @YES},
+        @{@"title": @"Site", @"kind": @"Link", @"url": @"https://example.com/a?b=1&c=2"},
+        @{@"title": @"Bad", @"kind": @"Link", @"url": @"javascript:alert(1)"},
+        @{@"title": @"Idea", @"kind": @"Note", @"text": @"<script>x</script>"}]);
+    check([exportPage containsString:@"<title>A &lt;b&gt;&amp;&lt;/b&gt; B</title>"] && ![exportPage containsString:@"<script>x"], @"escapes pack and note text in the export page");
+    check([exportPage containsString:@"<img src=\"files/My%20Shot.png\""] && [exportPage containsString:@"href=\"https://example.com/a?b=1&amp;c=2\""] && ![exportPage containsString:@"javascript:"], @"links files and web pages safely in the export page");
+    {
+        NSString *exportRoot = [NSTemporaryDirectory() stringByAppendingPathComponent:[@"lpp-selftest-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+        [NSFileManager.defaultManager createDirectoryAtPath:exportRoot withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *docPath = [exportRoot stringByAppendingPathComponent:@"Brief.pdf"];
+        [@"pdf" writeToFile:docPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NSArray *exportAssets = @[
+            @{@"title": @"Brief", @"kind": @"PDF", @"filePath": docPath},
+            @{@"title": @"Brief", @"kind": @"PDF", @"filePath": docPath},
+            @{@"title": @"Gone", @"kind": @"File", @"filePath": [exportRoot stringByAppendingPathComponent:@"missing.txt"]},
+            @{@"title": @"Idea / draft", @"kind": @"Note", @"payload": @"remember the milk"},
+            @{@"title": @"Site", @"kind": @"Link", @"originURL": @"https://example.com"}];
+        NSURL *zipURL = [NSURL fileURLWithPath:[exportRoot stringByAppendingPathComponent:@"out.zip"]];
+        NSUInteger exportedCount = 0, skippedCount = 0;
+        NSString *exportError = nil;
+        BOOL built = BuildPackExportZip(@"Launch Pack", exportAssets, zipURL, &exportedCount, &skippedCount, &exportError);
+        check(built && exportedCount == 4 && skippedCount == 1, @"zips a Pack's files, notes and links and skips missing files");
+        NSString *unzipDir = [exportRoot stringByAppendingPathComponent:@"unzipped"];
+        NSTask *unzipTask = [[NSTask alloc] init];
+        unzipTask.executableURL = [NSURL fileURLWithPath:@"/usr/bin/unzip"];
+        unzipTask.arguments = @[@"-q", zipURL.path, @"-d", unzipDir];
+        [unzipTask launchAndReturnError:nil];
+        [unzipTask waitUntilExit];
+        NSFileManager *fm = NSFileManager.defaultManager;
+        NSString *packFolder = [unzipDir stringByAppendingPathComponent:@"Launch Pack"];
+        NSString *indexHTML = [NSString stringWithContentsOfFile:[packFolder stringByAppendingPathComponent:@"index.html"] encoding:NSUTF8StringEncoding error:nil];
+        check([fm fileExistsAtPath:[packFolder stringByAppendingPathComponent:@"files/Brief.pdf"]] && [fm fileExistsAtPath:[packFolder stringByAppendingPathComponent:@"files/Brief 2.pdf"]], @"keeps duplicate-titled files apart inside the ZIP");
+        check([[NSString stringWithContentsOfFile:[packFolder stringByAppendingPathComponent:@"notes/Idea - draft.txt"] encoding:NSUTF8StringEncoding error:nil] isEqualToString:@"remember the milk"], @"saves notes as plain text files in the ZIP");
+        check([indexHTML containsString:@"Launch Pack"] && [indexHTML containsString:@"https://example.com"], @"puts an openable index page in the ZIP");
+        NSUInteger noneCount = 0;
+        check(!BuildPackExportZip(@"Empty", @[], zipURL, &noneCount, NULL, &exportError) && exportError.length, @"refuses to export an empty Pack");
+        [fm removeItemAtPath:exportRoot error:nil];
+    }
 
     NSArray<NSDictionary *> *selectionAssets = @[@{@"id": @"a"}, @{@"id": @"b"}, @{@"id": @"c"}, @{@"id": @"d"}];
     check([AssetIDsInInclusiveRange(selectionAssets, @"b", @"d") isEqualToArray:@[@"b", @"c", @"d"]], @"selects a forward asset range");

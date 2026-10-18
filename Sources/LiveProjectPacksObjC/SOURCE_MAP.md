@@ -11,6 +11,8 @@ cohesive helper area, update the build, run self-tests, then continue.
 - `LPPAssetHelpers.h/.m` owns asset path/origin/payload resolution, asset search,
   selection ranges, drag pasteboard writers, response extensions, and kind
   icon/color helpers.
+- `LPPPackExport.h/.m` builds the shareable ZIP of a Pack (files, notes as .txt, and an
+  index.html that opens in any browser) without needing Packs to view it.
 - `LPPWebParsing.h/.m` owns pure URL, HTML title, entity decoding, social-image,
   and whitespace helpers.
 - `LPPLiveClipCore.h/.m` owns Live Clip rect/source models, source relocation,
